@@ -9,6 +9,7 @@ class ModelArguments:
     """
 
     model_name_or_path: str = field(
+        default="Qwen/Qwen2.5-Coder-0.5B",
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
     ptuning_checkpoint: str = field(
@@ -70,17 +71,17 @@ class DataTrainingArguments:
     lang: Optional[str] = field(default=None, metadata={"help": "Language id for summarization."})
 
     dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+        default="newfacade/LeetCodeDataset", metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
     prompt_column: Optional[str] = field(
-        default=None,
+        default="query",
         metadata={"help": "The name of the column in the datasets containing the full texts (for summarization)."},
     )
     response_column: Optional[str] = field(
-        default=None,
+        default="response",
         metadata={"help": "The name of the column in the datasets containing the summaries (for summarization)."},
     )
     history_column: Optional[str] = field(

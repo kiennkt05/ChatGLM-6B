@@ -5,11 +5,37 @@
 
 *Read this in [English](README_en.md).
 
+## Quickstart：在 LeetCodeDataset 上微调 Qwen2.5-Coder
+
+该目录下的 `main.py` 现在默认使用 `Qwen/Qwen2.5-Coder-0.5B` 模型并直接从 Hugging Face 加载 `newfacade/LeetCodeDataset`（字段：`query` → `response`）。如果你想快速微调，可以按照以下步骤：
+
+1. 安装依赖：
+
+```shell
+pip install -r requirements.txt
+```
+
+2. 启动训练（示例命令，可根据显存自行调整批大小和 epoch）：
+
+```shell
+python ptuning/main.py \
+  --model_name_or_path Qwen/Qwen2.5-Coder-0.5B \
+  --dataset_name newfacade/LeetCodeDataset \
+  --prompt_column query \
+  --response_column response \
+  --do_train --do_eval --predict_with_generate \
+  --output_dir output/qwen2_5_coder_leetcode \
+  --per_device_train_batch_size 2 \
+  --per_device_eval_batch_size 2 \
+  --num_train_epochs 2 \
+  --learning_rate 5e-5 \
+  --fp16
+```
+
+脚本会自动创建缺失的验证/测试切分，并对英文代码题目的生成质量计算 ROUGE 与 BLEU-4 指标。
+
 ## 软件依赖
-运行微调需要4.27.1版本的`transformers`。除 ChatGLM-6B 的依赖之外，还需要安装以下依赖
-```
-pip install rouge_chinese nltk jieba datasets
-```
+推荐直接使用 `requirements.txt` 中列出的依赖，其中 `transformers` 升级到了支持 Qwen2.5 的版本，并内置了英文评估所需的 `nltk` 与 `rouge-score`。
 ## 使用方法
 
 ### 下载数据集

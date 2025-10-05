@@ -1,8 +1,11 @@
 protobuf
-transformers==4.27.1
+transformers>=4.39.0
+datasets>=2.16.0
 cpm_kernels
 torch>=1.10
 gradio
 mdtex2html
 sentencepiece
 accelerate
+nltk>=3.8.1
+rouge-score>=0.1.2

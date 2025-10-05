@@ -25,15 +25,14 @@ import json
 
 import numpy as np
 from datasets import load_dataset
-import jieba 
-from rouge_chinese import Rouge
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from rouge_score import rouge_scorer
 import torch
 
 import transformers
 from transformers import (
     AutoConfig,
-    AutoModel,
+    AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     HfArgumentParser,
@@ -96,12 +95,33 @@ def main():
         data_files["test"] = data_args.test_file
         extension = data_args.test_file.split(".")[-1]
 
-    raw_datasets = load_dataset(
-        extension,
-        data_files=data_files,
-        cache_dir=model_args.cache_dir,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
+    if data_args.dataset_name is not None:
+        raw_datasets = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    else:
+        raw_datasets = load_dataset(
+            extension,
+            data_files=data_files,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+    # If validation/test splits are missing, create them dynamically for reproducibility.
+    if training_args.do_eval and "validation" not in raw_datasets:
+        logger.info("Validation split not found; creating a 5% holdout from the training split.")
+        split = raw_datasets["train"].train_test_split(test_size=0.05, seed=training_args.seed)
+        raw_datasets = raw_datasets.remove_columns([])
+        raw_datasets["train"] = split["train"]
+        raw_datasets["validation"] = split["test"]
+    if training_args.do_predict and "test" not in raw_datasets:
+        logger.info("Test split not found; creating a 5% holdout from the training split.")
+        split = raw_datasets["train"].train_test_split(test_size=0.05, seed=training_args.seed)
+        raw_datasets["train"] = split["train"]
+        raw_datasets["test"] = split["test"]
 
     # Load pretrained model and tokenizer
     config = AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
@@ -110,29 +130,34 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
 
+    if tokenizer.pad_token is None:
+        pad_token = tokenizer.eos_token or tokenizer.bos_token or tokenizer.unk_token
+        if pad_token is None:
+            raise ValueError("Tokenizer must have either an EOS or BOS token to use as padding.")
+        tokenizer.pad_token = pad_token
+    if tokenizer.pad_token_id is not None and getattr(config, "pad_token_id", None) is None:
+        config.pad_token_id = tokenizer.pad_token_id
+
     if model_args.ptuning_checkpoint is not None:
-        # Evaluation
-        # Loading extra state dict of prefix encoder
-        model = AutoModel.from_pretrained(model_args.model_name_or_path, config=config, trust_remote_code=True)
-        prefix_state_dict = torch.load(os.path.join(model_args.ptuning_checkpoint, "pytorch_model.bin"))
-        new_prefix_state_dict = {}
-        for k, v in prefix_state_dict.items():
-            if k.startswith("transformer.prefix_encoder."):
-                new_prefix_state_dict[k[len("transformer.prefix_encoder."):]] = v
-        model.transformer.prefix_encoder.load_state_dict(new_prefix_state_dict)
-    else:
-        model = AutoModel.from_pretrained(model_args.model_name_or_path, config=config, trust_remote_code=True)
+        raise ValueError("P-tuning checkpoints are not supported for Qwen models in this script.")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16 if training_args.fp16 else None,
+    )
 
     if model_args.quantization_bit is not None:
-        print(f"Quantized to {model_args.quantization_bit} bit")
-        model = model.quantize(model_args.quantization_bit)
+        if hasattr(model, "quantize"):
+            print(f"Quantized to {model_args.quantization_bit} bit")
+            model = model.quantize(model_args.quantization_bit)
+        else:
+            logger.warning("Quantization was requested but is not supported by this model; ignoring quantization_bit.")
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+
     if model_args.pre_seq_len is not None:
-        # P-tuning v2
-        model = model.half()
-        model.transformer.prefix_encoder.float()
-    else:
-        # Finetune
-        model = model.float()
+        logger.warning("pre_seq_len is not supported for Qwen models and will be ignored.")
 
     prefix = data_args.source_prefix if data_args.source_prefix is not None else ""
 
@@ -152,6 +177,16 @@ def main():
     prompt_column = data_args.prompt_column
     response_column = data_args.response_column
     history_column = data_args.history_column
+
+    if prompt_column not in column_names:
+        raise ValueError(f"Prompt column '{prompt_column}' not found in the dataset. Available columns: {column_names}")
+    if response_column not in column_names:
+        raise ValueError(f"Response column '{response_column}' not found in the dataset. Available columns: {column_names}")
+    if history_column is not None and history_column not in column_names:
+        logger.warning(
+            "history_column '%s' not found in the dataset; continuing without conversation history.", history_column
+        )
+        history_column = None
     
     # Temporarily set max_target_length for training.
     max_target_length = data_args.max_target_length
@@ -190,52 +225,66 @@ def main():
         model_inputs = {
             "input_ids": [],
             "labels": [],
+            "attention_mask": [],
         }
+        eos_token_id = tokenizer.eos_token_id or tokenizer.pad_token_id
         for i in range(len(examples[prompt_column])):
-            if examples[prompt_column][i] and examples[response_column][i]:
-                query, answer = examples[prompt_column][i], examples[response_column][i]
+            query = examples[prompt_column][i]
+            answer = examples[response_column][i]
+            if not query or not answer:
+                continue
 
-                if history_column is None:
-                    prompt = query
-                else:
-                    prompt = ""
-                    history = examples[history_column][i]
-                    for turn_idx, (old_query, response) in enumerate(history):
-                        prompt += "[Round {}]\n问：{}\n答：{}\n".format(turn_idx, old_query, response)
-                    prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
+            if history_column is None or not examples.get(history_column):
+                prompt = query
+            else:
+                prompt = ""
+                history = examples[history_column][i]
+                for turn_idx, (old_query, response) in enumerate(history):
+                    prompt += "[Round {}]\n问：{}\n答：{}\n".format(turn_idx, old_query, response)
+                prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
 
-                prompt = prefix + prompt
-                a_ids = tokenizer.encode(text=prompt, add_special_tokens=False)
-                b_ids = tokenizer.encode(text=answer, add_special_tokens=False)
+            prompt = prefix + prompt
+            prompt_ids = tokenizer.encode(text=prompt, add_special_tokens=False)
+            answer_ids = tokenizer.encode(text=answer, add_special_tokens=False)
 
-                if len(a_ids) > data_args.max_source_length - 1:
-                    a_ids = a_ids[: data_args.max_source_length - 1]
+            if len(prompt_ids) > data_args.max_source_length:
+                prompt_ids = prompt_ids[: data_args.max_source_length]
 
-                if len(b_ids) > data_args.max_target_length - 2:
-                    b_ids = b_ids[: data_args.max_target_length - 2]
+            if len(answer_ids) > data_args.max_target_length - 1:
+                answer_ids = answer_ids[: data_args.max_target_length - 1]
 
-                input_ids = tokenizer.build_inputs_with_special_tokens(a_ids, b_ids)
+            if eos_token_id is not None:
+                answer_ids = answer_ids + [eos_token_id]
 
-                context_length = input_ids.index(tokenizer.bos_token_id)
-                mask_position = context_length - 1
-                labels = [-100] * context_length + input_ids[mask_position+1:]
-                
-                pad_len = max_seq_length - len(input_ids)
+            input_ids = prompt_ids + answer_ids
+            if len(input_ids) > max_seq_length:
+                input_ids = input_ids[:max_seq_length]
+
+            prompt_length = min(len(prompt_ids), len(input_ids))
+            labels = [-100] * prompt_length + input_ids[prompt_length:]
+
+            pad_len = max_seq_length - len(input_ids)
+            if pad_len > 0:
                 input_ids = input_ids + [tokenizer.pad_token_id] * pad_len
-                labels = labels + [tokenizer.pad_token_id] * pad_len
-                if data_args.ignore_pad_token_for_loss:
-                    labels = [(l if l != tokenizer.pad_token_id else -100) for l in labels]
+                pad_label = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
+                labels = labels + [pad_label] * pad_len
 
-                model_inputs["input_ids"].append(input_ids)
-                model_inputs["labels"].append(labels)
+            attention_mask = [0 if token == tokenizer.pad_token_id else 1 for token in input_ids]
+
+            model_inputs["input_ids"].append(input_ids)
+            model_inputs["labels"].append(labels)
+            model_inputs["attention_mask"].append(attention_mask)
 
         return model_inputs
     
     def print_dataset_example(example):
-        print("input_ids",example["input_ids"])
-        print("inputs", tokenizer.decode(example["input_ids"]))
+        print("input_ids", example["input_ids"])
+        print("inputs", tokenizer.decode(example["input_ids"], skip_special_tokens=False))
+        label_ids = [tokenizer.pad_token_id if token < 0 else token for token in example["labels"]]
         print("label_ids", example["labels"])
-        print("labels", tokenizer.decode(example["labels"]))
+        print("labels", tokenizer.decode(label_ids, skip_special_tokens=False))
+        if "attention_mask" in example:
+            print("attention_mask", example["attention_mask"])
 
     if training_args.do_train:
         if "train" not in raw_datasets:
@@ -304,6 +353,8 @@ def main():
     )
 
     # Metric
+    rouge = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+
     def compute_metrics(eval_preds):
         preds, labels = eval_preds
         if isinstance(preds, tuple):
@@ -321,15 +372,24 @@ def main():
             "bleu-4": []
         }
         for pred, label in zip(decoded_preds, decoded_labels):
-            hypothesis = list(jieba.cut(pred))
-            reference = list(jieba.cut(label))
-            rouge = Rouge()
-            scores = rouge.get_scores(' '.join(hypothesis) , ' '.join(reference))
-            result = scores[0]
-            
-            for k, v in result.items():
-                score_dict[k].append(round(v["f"] * 100, 4))
-            bleu_score = sentence_bleu([list(label)], list(pred), smoothing_function=SmoothingFunction().method3)
+            if not pred:
+                pred_tokens = []
+            else:
+                pred_tokens = pred.split()
+            if not label:
+                label_tokens = []
+            else:
+                label_tokens = label.split()
+
+            rouge_result = rouge.score(target=label, prediction=pred)
+            for k, v in rouge_result.items():
+                metric_key = k.replace("rouge", "rouge-")
+                score_dict[metric_key].append(round(v.fmeasure * 100, 4))
+
+            if label_tokens:
+                bleu_score = sentence_bleu([label_tokens], pred_tokens, smoothing_function=SmoothingFunction().method3)
+            else:
+                bleu_score = 0.0
             score_dict["bleu-4"].append(round(bleu_score * 100, 4))
 
         for k, v in score_dict.items():
@@ -365,7 +425,14 @@ def main():
         # elif last_checkpoint is not None:
         #     checkpoint = last_checkpoint
         model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+            def _make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+
+            if model.get_input_embeddings() is not None:
+                model.get_input_embeddings().register_forward_hook(_make_inputs_require_grad)
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         # trainer.save_model()  # Saves the tokenizer too for easy upload
 
